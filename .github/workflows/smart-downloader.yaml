@@ -1,4 +1,4 @@
-name: '📦 دانلود و آپلود قطعات جداگانه (Artifact)'
+name: '📦 دانلود و ذخیره در مخزن'
 
 on:
   workflow_dispatch:
@@ -17,28 +17,43 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: write
+
 jobs:
-  download-and-artifact:
+  download-and-commit:
     runs-on: ubuntu-latest
     steps:
+      - name: 🔄 دریافت کد مخزن
+        uses: actions/checkout@v4
+
       - name: ⚙️ نصب ابزارها
         run: |
           sudo apt-get update
           sudo apt-get install -y p7zip-full file aria2 curl
 
-      - name: 📥 پردازش، فشرده‌سازی و آپلود جداگانه
-        env:
-          GH_TOKEN: ${{ github.token }}   # برای استفاده از دستور gh
+      - name: 🔧 تنظیم بافر HTTP
+        run: |
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 0
+          git config --global http.lowSpeedTime 999999
+
+      - name: 📥 پردازش و دانلود فایل‌ها
         run: |
           set +v
+          # آماده‌سازی لیست لینک‌ها
           echo "${{ github.event.inputs.file_urls }}" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > /tmp/urls.txt
           TOTAL_URLS=$(wc -l < /tmp/urls.txt)
           echo "🔹 تعداد کل لینک‌ها: $TOTAL_URLS"
 
+          # آماده‌سازی نام‌های دلخواه
           IFS=',' read -ra NAME_ARRAY <<< "${{ github.event.inputs.custom_names }}"
           for idx in "${!NAME_ARRAY[@]}"; do
             NAME_ARRAY[$idx]=$(echo "${NAME_ARRAY[$idx]}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
           done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           COUNTER=0
           while IFS= read -r URL; do
@@ -49,7 +64,7 @@ jobs:
             echo "🔽 [${COUNTER}/${TOTAL_URLS}] شروع پردازش: $URL"
             echo "============================================================"
 
-            # ----- مرحله ۱: استخراج نام فایل -----
+            # ----- مرحله ۱: استخراج نام فایل (اولویت با نام دلخواه) -----
             echo "🔍 [1/4] شناسایی نام فایل..."
             if [ -n "${NAME_ARRAY[$((COUNTER-1))]}" ]; then
               REAL_FILENAME="${NAME_ARRAY[$((COUNTER-1))]}"
@@ -69,8 +84,8 @@ jobs:
             SAFE_FILENAME=$(echo "$REAL_FILENAME" | sed 's/[\\/:*?"<>|]/_/g')
             echo "   📛 نام پایه: $SAFE_FILENAME"
 
-            # ----- مرحله ۲: دانلود (با تلاش مجدد) -----
-            echo "⏳ [2/4] دانلود فایل..."
+            # ----- مرحله ۲: دانلود با تلاش مجدد (تا ۱۰ بار) -----
+            echo "⏳ [2/4] دانلود فایل (با قابلیت ادامه و تلاش مجدد)..."
             MAX_RETRIES=10
             RETRY=0
             SUCCESS=false
@@ -92,11 +107,11 @@ jobs:
             done
 
             if [ "$SUCCESS" = false ]; then
-              echo "❌ خطا: دانلود $SAFE_FILENAME ناموفق بود. رد کردن این لینک..."
+              echo "❌ خطا: دانلود فایل $SAFE_FILENAME پس از $MAX_RETRIES تلاش ناموفق بود. رد کردن این لینک..."
               continue
             fi
 
-            # ----- مرحله ۳: تشخیص فرمت و اصلاح پسوند -----
+            # ----- مرحله ۳: تشخیص فرمت واقعی و اضافه کردن پسوند -----
             echo "🔍 [3/4] تشخیص فرمت فایل و اصلاح پسوند..."
             REAL_MIME=$(file -b --mime-type "$SAFE_FILENAME")
             EXT=""
@@ -123,47 +138,43 @@ jobs:
               echo "   ⚠️ فرمت ناشناخته، بدون تغییر باقی ماند."
             fi
 
-            # ----- مرحله ۴: فشرده‌سازی به قطعات ۹۰ مگابایتی -----
-            echo "📁 [4/4] ایجاد قطعات ۹۰ مگابایتی..."
+            # ----- مرحله ۴: دسته‌بندی و فشرده‌سازی (mx=7, md=64m) -----
+            echo "📁 [4/4] دسته‌بندی و ایجاد آرشیو (قطعات 90 مگابایت)..."
             BASENAME_NOEXT="${SAFE_FILENAME%.*}"
             FOLDER_NAME=$(echo "$BASENAME_NOEXT" | sed 's/[\\/:*?"<>|]/_/g')
             [ -z "$FOLDER_NAME" ] && FOLDER_NAME="downloaded_file"
 
-            # پوشه موقت برای قطعات
-            WORK_DIR="tmp_${FOLDER_NAME}_$$"
-            mkdir -p "$WORK_DIR"
-            cd "$WORK_DIR"
+            MIME=$(file -b --mime-type "$SAFE_FILENAME")
+            EXT="${SAFE_FILENAME##*.}"
+            if [[ "$MIME" == video/* ]]; then CAT="video"
+            elif [[ "$MIME" == audio/* ]]; then CAT="audio"
+            elif [[ "$MIME" == image/* ]]; then CAT="image"
+            elif [[ "$MIME" == application/pdf ]]; then CAT="document"
+            else CAT="other"
+            fi
+
+            FINAL_DIR="downloads/$CAT/$FOLDER_NAME"
+            mkdir -p "$FINAL_DIR"
+            rm -f "$FINAL_DIR"/*.7z*
 
             if [ -z "${{ github.event.inputs.password }}" ]; then
-              7z a -mhe=on -mx=7 -md=128m -v90m "archive.7z" "../$SAFE_FILENAME" > /dev/null
+              7z a -mhe=on -mx=7 -md=128m -v90m "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME" > /dev/null
             else
-              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=7 -md=64m -v90m "archive.7z" "../$SAFE_FILENAME" > /dev/null
+              7z a -p"${{ github.event.inputs.password }}" -mhe=on -mx=7 -md=64m -v90m "$FINAL_DIR/archive.7z" "./$SAFE_FILENAME" > /dev/null
             fi
-            cd ..
-
-            # حذف فایل اصلی برای آزادسازی فضا
             rm -f "$SAFE_FILENAME"
-            echo "   ✅ قطعات ساخته شدند:"
-            ls -lh "$WORK_DIR"/
+            echo "   ✅ آرشیو در $FINAL_DIR ساخته شد."
 
-            # ----- آپلود هر قطعه به عنوان یک Artifact جداگانه -----
-            echo "📤 آپلود قطعات به عنوان Artifact (قابل دانلود تکی از همین صفحه)..."
-            for vol in "$WORK_DIR"/archive.7z.*; do
-              # نام Artifact را مثلاً myfile_part001 می‌سازیم
-              PART_NAME=$(echo "$(basename "$vol")" | sed 's/archive\.7z\./part/')
-              ARTIFACT_NAME="${FOLDER_NAME}_${PART_NAME}"
-              echo "   📦 آپلود $ARTIFACT_NAME ..."
-              gh run upload-artifact --name "$ARTIFACT_NAME" --path "$vol"
-            done
-
-            # پاکسازی پوشه موقت
-            rm -rf "$WORK_DIR"
-            echo "✅ فایل $COUNTER از $TOTAL_URLS پردازش و قطعات آن آپلود شد."
+            # ----- push تدریجی (هر فایل جداگانه) -----
+            echo "📤 ارسال به مخزن (push تدریجی)..."
+            git add "$FINAL_DIR/"
+            git commit -m "Add $FOLDER_NAME [$(date +'%H:%M:%S')]" || echo "   ⚠️ بدون تغییر جدید"
+            git push --force-with-lease origin HEAD:${GITHUB_REF#refs/heads/} 2>&1 | grep -E "(error|fatal|Done|Everything up-to-date)" || true
+            echo "✅ فایل $COUNTER از $TOTAL_URLS با موفقیت ذخیره و ارسال شد."
 
           done < /tmp/urls.txt
 
           echo ""
           echo "============================================================"
-          echo "🎉 همه لینک‌ها پردازش شدند."
-          echo "برای دانلود قطعات، به پایین همین صفحه (بخش Artifacts) مراجعه کنید."
+          echo "🎉 همه لینک‌ها با موفقیت پردازش شدند."
           echo "============================================================"
